@@ -133,6 +133,13 @@ if (startIdx > 0) {
 stage('Build & Test') {
 	def buildTypes = ['asan', 'ccmode', 'dev', 'production', 'hwhsm']
 	def testModes = [asan: 'dev']
+	// Extra VM-container-tests.sh flags per buildtype. With --test-pkcs11,
+	// stepIntegrationTest runs the suite twice: with softtokens first, then
+	// with softhsm2-backed PKCS#11 tokens.
+	def extraOpts = [dev: '--test-pkcs11 libsofthsm2.so']
+	// 'Test <buildtype>' stage timeout in minutes, default 60. dev runs two
+	// passes, each capped at 50 min in stepIntegrationTest.
+	def testTimeouts = [dev: 120]
 	def hsmEnvs = [
 		schsm: { -> [serial: env.SCHSM_SERIAL, vid: env.SCHSM_VID, pid: env.SCHSM_PID, pin: env.PHYSHSM_PIN] },
 		bnse:  { -> [serial: env.BNSE_SERIAL,  vid: env.BNSE_VID,  pid: env.BNSE_PID,  pin: env.PHYSHSM_PIN] },
@@ -299,7 +306,7 @@ stage('Build & Test') {
 			} else if (!params.RELEASE_BUILD) {
 				stage("Test ${buildtype}") {
 				node(params.LABEL_TESTER ?: 'tester') {
-					timeout(time: 60, unit: 'MINUTES') {
+					timeout(time: testTimeouts[buildtype] ?: 60, unit: 'MINUTES') {
 					try {
 						dir('.manifests') {
 							checkout scm
@@ -320,7 +327,8 @@ stage('Build & Test') {
 								hsm_serial: "",
 								hsm_vid: "",
 								hsm_pid: "",
-								hsm_pin: "")
+								hsm_pin: "",
+								extra_opts: (extraOpts[buildtype] ?: ''))
 						}
 					} finally {
 						doCleanup()
