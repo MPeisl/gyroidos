@@ -141,7 +141,6 @@ stage('Build & Test') {
 		bnse:  { -> [serial: env.BNSE_SERIAL,  vid: env.BNSE_VID,  pid: env.BNSE_PID,  pin: env.PHYSHSM_PIN] },
 	]
 	def branches = [:]
-	def completedBuilds = java.util.Collections.synchronizedMap(new java.util.HashMap())
 
 	def activeBuildTypes = buildTypes.findAll { bt ->
 		!(params.RELEASE_BUILD && bt != "dev" && bt != "production")
@@ -243,26 +242,31 @@ stage('Build & Test') {
 								buildSteps: doBuild
 							)
 						}
-					} catch (e) {
-						completedBuilds.put(buildtype, e)
-						throw e
 					} finally {
-						completedBuilds.putIfAbsent(buildtype, null)
 						doCleanup()
 					}
 					} // withEnv
 					} // timeout
 				} // node
 				} // stage
-			} else {
-				completedBuilds.put(buildtype, null)
 			}
 
 			// --- Test phase (skip during release builds) ---
 			if (!params.RELEASE_BUILD && buildtype == 'hwhsm') {
+				if (params.GYROID_MACHINE != 'genericx86-64') {
+					// Token tests only exist for genericx86-64 (see integrationTestMap in
+					// stepIntegrationTest) - skip here so no tokentest node is allocated.
+					echo "Skipping hwhsm token tests: no integration test defined for ${params.GYROID_MACHINE}"
+					return
+				}
 				stage("Test hwhsm") {
 					parallel(['schsm', 'bnse'].collectEntries { testtype ->
 						["Test ${buildtype} [${testtype.toUpperCase()}]": {
+							// Take the token lock before requesting a node: a run queued on the
+							// lock then waits on the flyweight thread instead of occupying a
+							// tokentest executor. Locking inside stepIntegrationTest is disabled
+							// via external_lock (locks are not reentrant).
+							lock("hwhsm-${testtype}") {
 							node(params.LABEL_TOKENTEST ?: 'tokentest') {
 								timeout(time: 60, unit: 'MINUTES') {
 								try {
@@ -281,6 +285,7 @@ stage('Build & Test') {
 										test_mode: "ccmode",
 										selector: buildParameter('BUILDSELECTOR'),
 										stage_name: STAGE_NAME,
+										external_lock: true,
 										hsm_serial: hsm.serial,
 										hsm_vid: hsm.vid,
 										hsm_pid: hsm.pid,
@@ -290,6 +295,7 @@ stage('Build & Test') {
 								}
 								} // timeout
 							} // node
+							} // lock
 						}]
 					})
 				}
@@ -330,46 +336,23 @@ stage('Build & Test') {
 		}
 	}
 
-	if (params.SYNC_MIRRORS == 'y' && startIdx <= 1) {
-		parallel(
-			'Builds and Tests': {
-				parallel branches
-			},
-			'SSH Mirror Sync': {
-				def allBuildsOk = true
-				stage("Waiting for Builds") {
-					waitUntil(initialRecurrencePeriod: 1000, quiet: true) {
-						completedBuilds.keySet().containsAll(activeBuildTypes)
-					}
-					if (completedBuilds.any { k, v -> v != null }) {
-						echo "Not all builds succeeded, skipping mirror sync"
-						allBuildsOk = false
-					}
-				}
-
-				if (allBuildsOk) {
-				stage("Sync Mirror") {
-				node(params.LABEL_BUILDER ?: 'worker') {
-					timeout(time: 60, unit: 'MINUTES') {
-					try {
-						lock('mirror-sync') {
-							catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
-								sh "ssh -o StrictHostKeyChecking=accept-new root@localhost"
-							}
-						}
-					} finally {
-						doCleanup()
-					}
-					} // timeout
-				} // node
-				} // stage
-				} // if allBuildsOk
-			}
-		)
-	} else {
-		parallel branches
-	}
+	parallel branches
 } // stage('Build & Test')
+
+// release builds skip all test stages, so there is nothing to summarize
+if (!params.RELEASE_BUILD) {
+	stage('Error Summary') {
+		node(params.LABEL_TESTER ?: 'tester') {
+			timeout(time: 10, unit: 'MINUTES') {
+			try {
+				stepErrorSummary()
+			} finally {
+				doCleanup()
+			}
+			} // timeout
+		} // node
+	} // stage
+}
 
 
 /*TODO deploy the development and production images on separate machines
